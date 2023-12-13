@@ -1,0 +1,95 @@
+#!/bin/bash
+#-serial chardev:char1 -chardev socket,id=char1,port=3333,host=0.0.0.0,server,nowait,telnet
+: "${ovmf:=ovmf-x86_64-ms}"
+
+helpandquit()
+{
+	cat <<-EOF
+		Usage: $0 IMG [OPTIONS] [QEMU OPTIONS]
+		OPTIONS:
+		  --serial		Mux serial console and monitor on current tty
+		  --spice		Create spice listener on port 5930
+		  --uefi		Boot using UEFI firmwware $ovmf
+		  --tpm			Start swtpm
+		  --fido2		Add canokey software fido2
+		  --bind DIR		Mount DIR inside the VM
+		  --help		This screen
+	EOF
+	exit "${1:-0}"
+}
+
+img="$1"
+[ -n "$img" -a "$img" != '--help' ] || helpandquit 1
+shift
+extra_args=()
+fstab_extra=()
+while [ "${1:0:2}" = '--' ]; do
+	if [ "$1" = "--help" ]; then
+		helpandquit
+	elif [ "$1" = "--serial" ]; then
+		shift
+		extra_args+=(\
+			"-chardev" "stdio,mux=on,signal=off,id=serial0" \
+			"-mon" "chardev=serial0,mode=readline" \
+			"-serial" "chardev:serial0" \
+		)
+	elif [ "$1" = "--spice" ]; then
+		shift
+		extra_args+=(\
+		"-device" "virtio-serial-pci" \
+		"-chardev" "spicevmc,id=charchannel0,name=vdagent" \
+		"-device" "virtserialport,chardev=charchannel0,id=channel0,name=com.redhat.spice.0" \
+		-vga virtio -spice "port=5930,disable-ticketing" \
+		)
+	elif [ "$1" = "--uefi" ]; then
+		shift
+		imgvars="${img#*:}.efivars"
+		if [ ! -e "$imgvars" ]; then
+			cp "/usr/share/qemu/${ovmf}-vars.bin" "$imgvars"
+		fi
+		extra_args+=(\
+		-drive "id=pflash-code-overlay0,if=pflash,file=/usr/share/qemu/${ovmf}-code.bin,unit=0,readonly=on" \
+		-drive "id=pflash-vars-overlay0,if=pflash,file=$imgvars,unit=1" \
+		)
+	elif [ "$1" = "--tpm" ]; then
+		shift
+		mkdir -p "$img.tpm" || :
+		swtpm socket -d --tpmstate dir="$img.tpm" --ctrl type=unixio,path="$img.tpm/swtpm-sock,terminate" --tpm2 --log file="$img.tpm/log",level=20
+		sleep 1
+		extra_args+=(\
+		  -chardev socket,id=chrtpm,path="$img.tpm/swtpm-sock" \
+		  -tpmdev emulator,id=tpm0,chardev=chrtpm \
+		  -device tpm-tis,tpmdev=tpm0 \
+		)
+	elif [ "$1" = "--fido2" ]; then
+		extra_args+=(-usb -device "canokey,file=$img.canokey")
+		shift
+	elif [ "$1" = "--bind" ]; then
+		tag="${2##*/}"
+		: "${bindno:=0}"
+		extra_args+=("-fsdev" "local,security_model=none,id=fsdev$bindno,path=$2" \
+			-device "virtio-9p-pci,id=fs$bindno,fsdev=fsdev$bindno,mount_tag=$tag")
+		fstab_extra+=("$tag /run/qemu/$tag 9p trans=virtio,version=9p2000.L")
+		((bindno++))
+		shift 2
+	else
+		echo "Unknown arg $1" >&2
+		exit 1
+	fi
+done
+
+if [ -n "$fstab_extra" ]; then
+	extra_args+=(-smbios "type=11,value=io.systemd.credential.binary:fstab.extra=$(for i in "${fstab_extra[@]}"; do echo "$i"; done |base64 -w0)")
+fi
+if [ -d "$img" ]; then
+	img="fat:fat-type=32:${img//:/\\:},format=vvfat,label=HDD"
+fi
+
+exec qemu-system-x86_64 -enable-kvm \
+	-device virtio-blk,drive=hd1 \
+	-drive file="$img",cache=unsafe,if=none,id=hd1 \
+	-machine type=q35,accel=kvm \
+	-object rng-random,id=rng0,filename=/dev/urandom -device virtio-rng-pci,rng=rng0 \
+	-smp 2 \
+	"${extra_args[@]}" \
+	"$@"
